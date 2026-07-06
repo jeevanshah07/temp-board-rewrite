@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
     });
 
+    mb.install_firmware(fw, .{});
+
+    // For debugging, we also always install the firmware as an ELF file
     mb.install_firmware(fw, .{ .format = .elf });
     mb.install_firmware(fw, .{ .format = .binary });
 }
