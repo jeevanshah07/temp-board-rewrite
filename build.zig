@@ -23,5 +23,5 @@ pub fn build(b: *std.Build) void {
 
     // For debugging, we also always install the firmware as an ELF file
     mb.install_firmware(fw, .{ .format = .elf });
-    mb.install_firmware(fw, .{ .format = .bin });
+    mb.install_firmware(fw, .{ .format = .binary });
 }

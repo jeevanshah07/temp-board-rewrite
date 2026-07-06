@@ -4,13 +4,27 @@
 
 const std = @import("std");
 const microzig = @import("microzig");
-const hal = microzig.hal;
+const stm32 = microzig.hal;
 const chip = microzig.chip;
 const peripherals = chip.peripherals;
+const rcc = stm32.rcc;
+const gpio = stm32.gpio;
+const time = stm32.time;
+
+const spi = stm32.spi.SPI.init(.SPI1);
+const adc = stm32.adc.ADC.init(.ADC1);
+const uart = stm32.uart.UART.init(.USART1);
 
 pub const microzig_options: microzig.Options = .{
     .interrupts = .{},
 };
+
+pub const panic = microzig.panic;
+pub const std_options = microzig.std_options(.{});
+
+comptime {
+    _ = microzig.export_startup();
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,15 +63,15 @@ const BiquadState = struct {
     w2: f64 = 0.0,
 };
 
-var biquad_state: [NUM_CHANNELS_TOTAL]BiquadState = [_]BiquadState{.{}} ** NUM_CHANNELS_TOTAL;
+var biquad_state: [NUM_CHANNELS_TOTAL]BiquadState = @splat(.{});
 
 fn biquadReset(mux: u8, ch: u8) void {
-    const idx: usize = @as(usize, mux) * MUX_CHANNELS_PER_CHIP + ch;
+    const idx: usize = @as(usize, mux) * @as(usize, MUX_CHANNELS_PER_CHIP) + @as(usize, ch);
     biquad_state[idx] = .{};
 }
 
 fn biquadProcess(mux: u8, ch: u8, x: f64) f64 {
-    const idx: usize = @as(usize, mux) * MUX_CHANNELS_PER_CHIP + ch;
+    const idx: usize = @as(usize, mux) * @as(usize, MUX_CHANNELS_PER_CHIP) + @as(usize, ch);
     const s = &biquad_state[idx];
     const w0 = x - BIQUAD_A1 * s.w1 - BIQUAD_A2 * s.w2;
     const y = BIQUAD_B0 * w0 + BIQUAD_B1 * s.w1 + BIQUAD_B2 * s.w2;
@@ -67,54 +81,34 @@ fn biquadProcess(mux: u8, ch: u8, x: f64) f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Pins — SHAKY: verify against actual microzig.hal pin API
+// Pins
 // ---------------------------------------------------------------------------
 const pins = struct {
-    const mux_sync = [NUM_MUXES]hal.gpio.Pin{
-        hal.gpio.Pin.init(.B, 0),
-        hal.gpio.Pin.init(.B, 1),
-        hal.gpio.Pin.init(.B, 2),
+    const mux_sync = [NUM_MUXES]gpio.Pin{
+        gpio.Pin.from_port(.B, 0),
+        gpio.Pin.from_port(.B, 1),
+        gpio.Pin.from_port(.B, 2),
     };
-    const spi_sck = hal.gpio.Pin.init(.A, 5);
-    const spi_mosi = hal.gpio.Pin.init(.A, 7);
-    const adc_in = hal.gpio.Pin.init(.A, 2);
-    const uart_tx = hal.gpio.Pin.init(.A, 9);
-    const uart_rx = hal.gpio.Pin.init(.A, 10);
-    const can_rx = hal.gpio.Pin.init(.A, 11);
-    const can_tx = hal.gpio.Pin.init(.A, 12);
+    const spi_sck = gpio.Pin.from_port(.A, 5);
+    const spi_mosi = gpio.Pin.from_port(.A, 7);
+    const adc_in = gpio.Pin.from_port(.A, 2);
+    const uart_tx = gpio.Pin.from_port(.A, 9);
+    const uart_rx = gpio.Pin.from_port(.A, 10);
+    const can_rx = gpio.Pin.from_port(.A, 11);
+    const can_tx = gpio.Pin.from_port(.A, 12);
 };
-
-var spi_dev: hal.spi.SPI = undefined;
-var adc_dev: hal.adc.ADC = undefined;
-var uart_dev: hal.uart.UART = undefined;
-
-// ---------------------------------------------------------------------------
-// DWT-based delay_us — direct register access, stable across all Cortex-M3 parts
-// ---------------------------------------------------------------------------
-fn delayUs(us: u32) void {
-    const dwt = peripherals.DWT;
-    const start = dwt.CYCCNT.raw;
-    const ticks = us * (hal.clocks.system_clock_hz() / 1_000_000);
-    while ((dwt.CYCCNT.raw -% start) < ticks) {}
-}
-
-fn enableDwtCycleCounter() void {
-    peripherals.CoreDebug.DEMCR.modify(.{ .TRCENA = 1 });
-    peripherals.DWT.CYCCNT.raw = 0;
-    peripherals.DWT.CTRL.modify(.{ .CYCCNTENA = 1 });
-}
 
 // ---------------------------------------------------------------------------
 // Mux control (bit-banged SYNC + SPI 1-line write, same as original)
 // ---------------------------------------------------------------------------
 fn muxWriteRaw(mux: MuxId, cmd: u8) !void {
-    for (pins.mux_sync) |p| p.set(); // deassert all (open-drain, high = released)
+    for (pins.mux_sync) |p| p.put(1); // deassert all (open-drain, high = released)
     const idx = @intFromEnum(mux);
-    pins.mux_sync[idx].clear(); // assert SYNC for target mux
+    pins.mux_sync[idx].put(0); // assert SYNC for target mux
 
-    try spi_dev.writeBlocking(&[_]u8{cmd}, .{});
+    spi.write_blocking(&[_]u8{cmd});
 
-    pins.mux_sync[idx].set();
+    pins.mux_sync[idx].put(1);
 }
 
 fn muxDisable(mux: MuxId) !void {
@@ -140,9 +134,7 @@ fn muxSelectChannel(mux: MuxId, channel: u8) !void {
 // ADC — single conversion, blocking poll
 // ---------------------------------------------------------------------------
 fn adcReadRaw() u16 {
-    adc_dev.startConversion();
-    adc_dev.waitForConversion();
-    return adc_dev.readResult();
+    return adc.read_single_channel(2) catch 0;
 }
 
 fn adcReadRawSettled() u16 {
@@ -181,20 +173,20 @@ fn sensorVoltageToTempC(voltage: f32) f32 {
 var can_tx_data: [8]u8 = undefined;
 
 fn canInitFilter() void {
-    const can = peripherals.CAN1;
+    const can = peripherals.CAN;
 
     can.FMR.modify(.{ .FINIT = 1 });
-    can.FM1R.modify(.{ .FBM0 = 0 }); // mask mode, bank 0
-    can.FS1R.modify(.{ .FSC0 = 1 }); // 32-bit scale, bank 0
-    can.FFA1R.modify(.{ .FFA0 = 0 }); // -> FIFO0
-    can.sFilterRegister[0].FR1.raw = 0x0000_0000;
-    can.sFilterRegister[0].FR2.raw = 0x0000_0000; // mask = 0 -> accept all
-    can.FA1R.modify(.{ .FACT0 = 1 }); // activate bank 0
+    can.FM1R.raw &= ~@as(u32, 1); // mask mode, bank 0
+    can.FS1R.raw |= 1; // 32-bit scale, bank 0
+    can.FFA1R.raw &= ~@as(u32, 1); // -> FIFO0
+    can.FB[0].FR1.raw = 0x0000_0000;
+    can.FB[0].FR2.raw = 0x0000_0000; // mask = 0 -> accept all
+    can.FA1R.raw |= 1; // activate bank 0
     can.FMR.modify(.{ .FINIT = 0 });
 }
 
 fn canStart() void {
-    const can = peripherals.CAN1;
+    const can = peripherals.CAN;
     can.MCR.modify(.{ .SLEEP = 0, .INRQ = 0 });
     while (can.MSR.read().INAK == 1) {}
 }
@@ -202,10 +194,10 @@ fn canStart() void {
 /// checksum + no-ACK/mailbox-full visibility (fixes the silent-drop bug from
 /// the C version — returns error instead of swallowing HAL_BUSY)
 fn canFindFreeMailbox() !u2 {
-    const tsr = peripherals.CAN1.TSR.read();
-    if (tsr.TME0 == 1) return 0;
-    if (tsr.TME1 == 1) return 1;
-    if (tsr.TME2 == 1) return 2;
+    const tsr = peripherals.CAN.TSR.read();
+    if (tsr.@"TME[0]" == 1) return 0;
+    if (tsr.@"TME[1]" == 1) return 1;
+    if (tsr.@"TME[2]" == 1) return 2;
     return error.CanMailboxesFull; // all 3 full -> bus fault, not backpressure
 }
 
@@ -220,7 +212,7 @@ fn canSendChannelTemp(id: u32, temp: [7]u8) !void {
 }
 
 fn canSendTemperatureStatistics(stats: *const TempStatistics) !void {
-    var data = [_]u8{0} ** 8;
+    var data: [8]u8 = @splat(0);
     data[1] = @bitCast(@as(i8, @truncate(stats.min_temp)));
     data[2] = @bitCast(@as(i8, @truncate(stats.max_temp)));
     data[3] = stats.max_channel;
@@ -236,21 +228,23 @@ fn canSendTemperatureStatistics(stats: *const TempStatistics) !void {
 }
 
 fn canTransmit(ext_id: u32, data: []const u8) !void {
-    const mb = try canFindFreeMailbox();
-    const box = &peripherals.CAN1.sTxMailBox[mb];
+    if (data.len != 8) return error.InvalidCanPayloadLength;
 
-    box.TIR.raw = (ext_id << 3) | (1 << 2); // EXID field, IDE=1 (extended)
-    box.TDTR.modify(.{ .DLC = @as(u4, @intCast(data.len)) });
-    box.TDLR.raw = std.mem.readInt(u32, data[0..4], .little);
-    box.TDHR.raw = std.mem.readInt(u32, data[4..8], .little);
-    box.TIR.modify(.{ .TXRQ = 1 }); // request transmission
+    const mb = try canFindFreeMailbox();
+    const mailbox = &peripherals.CAN.TX[mb];
+
+    mailbox.TIR.raw = (ext_id << 3) | (1 << 2); // EXID field, IDE=1 (extended)
+    mailbox.TDTR.modify(.{ .DLC = @as(u4, @intCast(data.len)) });
+    mailbox.TDLR.raw = std.mem.readInt(u32, data[0..4], .little);
+    mailbox.TDHR.raw = std.mem.readInt(u32, data[4..8], .little);
+    mailbox.TIR.modify(.{ .TXRQ = 1 }); // request transmission
 }
 
 // ---------------------------------------------------------------------------
 // Main scan loop
 // ---------------------------------------------------------------------------
 fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
-    var temps: [90]u8 = [_]u8{0} ** 90;
+    // var temps: [90]u8 = [_]u8{0} ** 90;
     var high_temps: i8 = 0;
 
     var mux: u8 = 0;
@@ -264,51 +258,20 @@ fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
             var count: u16 = 0;
 
             muxSelectChannel(@enumFromInt(mux), ch) catch continue;
-            hal.time.sleep_ms(5);
+            time.sleep_ms(5);
             biquadReset(mux, ch);
 
-            if (mux == 2 and ch == 4) {
-                var daq_samples = [_]u8{0} ** 7;
-                var daq_idx: u8 = 0;
-                var daq_packet_seq: u32 = 0;
-
-                var i: u16 = 0;
-                while (i < 500) : (i += 1) {
-                    const raw = adcReadRawSettled();
-                    const filtered = biquadProcess(mux, ch, @floatFromInt(raw));
-                    const raw_f: u16 = @intFromFloat(filtered + 0.5);
-
-                    daq_samples[daq_idx] = @intFromFloat(100.0 * (3.0 * @as(f32, @floatFromInt(raw_f)) / 4095.0));
-                    daq_idx += 1;
-
-                    if (daq_idx == 7) {
-                        const daq_id = DAQ_BASE_ID + daq_packet_seq;
-                        canSendChannelTemp(daq_id, daq_samples) catch {};
-                        daq_packet_seq += 1;
-                        daq_idx = 0;
-                        daq_samples = [_]u8{0} ** 7;
-                    }
-
-                    if (raw_f <= 1911 or raw_f >= 2962) {
-                        faults += 1;
-                        continue;
-                    }
-                    sum += raw_f;
-                    count += 1;
+            var i: u16 = 0;
+            while (i < 500) : (i += 1) {
+                const raw = adcReadRawSettled();
+                // NOTE: biquad intentionally unused here, matching original
+                // (only the mux2/ch4 DAQ path filters — inherited quirk).
+                if (raw <= 1911 or raw >= 2962) {
+                    faults += 1;
+                    continue;
                 }
-            } else {
-                var i: u16 = 0;
-                while (i < 500) : (i += 1) {
-                    const raw = adcReadRawSettled();
-                    // NOTE: biquad intentionally unused here, matching original
-                    // (only the mux2/ch4 DAQ path filters — inherited quirk).
-                    if (raw <= 1911 or raw >= 2962) {
-                        faults += 1;
-                        continue;
-                    }
-                    sum += raw;
-                    count += 1;
-                }
+                sum += raw;
+                count += 1;
             }
 
             var temp_c: f32 = undefined;
@@ -317,6 +280,7 @@ fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
                 temp_c = 80;
                 high_temps += 1;
             } else {
+                if (count == 0) continue;
                 sum /= count;
                 const voltage = 3.0 * @as(f32, @floatFromInt(sum)) / 4095.0;
                 temp_c = sensorVoltageToTempC(voltage);
@@ -328,8 +292,8 @@ fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
                 }
             }
 
-            const idx: usize = @as(usize, mux) * MUX_CHANNELS_PER_CHIP + ch;
-            temps[idx] = @intFromFloat(temp_c);
+            // const idx: usize = @as(usize, mux) * MUX_CHANNELS_PER_CHIP + ch;
+            // temps[idx] = @intFromFloat(temp_c);
 
             if (report) {
                 if (stats.min_temp == 300 or stats.max_temp == -300) continue;
@@ -357,69 +321,71 @@ fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
 }
 
 // ---------------------------------------------------------------------------
-// Clock config — HSE 8MHz -> PLLx9 = 72MHz, ADC /6.
-// NOTE: AHB divider is /2 here, matching the original (looks like an inherited
-// bug — halves HCLK to 36MHz instead of running at full 72MHz — not fixed,
-// ported as-is per your original comment structure).
+// Clock config — HSE 8MHz -> PLLx9 = 72MHz, AHB /1, APB1 /2, ADC /6.
 // ---------------------------------------------------------------------------
-fn systemClockConfig() void {
-    hal.rcc.configure(.{
-        .hse_hz = 8_000_000,
-        .pll = .{ .source = .hse, .mul = 9 },
-        .ahb_div = 2,
-        .apb1_div = 2,
-        .apb2_div = 1,
-        .adc_div = 6,
+fn systemClockConfig() !void {
+    _ = try rcc.apply(.{
+        .SYSCLKSource = .PLL1_P,
+        .PLLSourceVirtual = .HSE_Div_PREDIV,
+        .PLLMUL = .Mul9,
+        .AHBCLKDivider = .Div1,
+        .APB1CLKDivider = .Div2,
+        .ADCPresc = .Div6,
+        .flags = .{
+            .HSEOscillator = true,
+            .USE_ADC1 = true,
+        },
     });
-    hal.rcc.enableCss();
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 pub fn main() !void {
-    systemClockConfig();
+    try systemClockConfig();
 
-    for (pins.mux_sync) |p| p.setMode(.output_open_drain);
-    pins.spi_sck.setMode(.alt_push_pull);
-    pins.spi_mosi.setMode(.alt_push_pull);
-    pins.adc_in.setMode(.analog);
-    pins.uart_tx.setMode(.alt_push_pull);
-    pins.uart_rx.setMode(.input_floating);
-    pins.can_rx.setMode(.input_floating);
-    pins.can_tx.setMode(.alt_push_pull);
+    rcc.enable_clock(.GPIOA);
+    rcc.enable_clock(.GPIOB);
+    rcc.enable_clock(.AFIO);
+    rcc.enable_clock(.SPI1);
+    rcc.enable_clock(.ADC1);
+    rcc.enable_clock(.USART1);
+    rcc.enable_clock(.CAN);
+    rcc.enable_clock(.TIM2);
 
-    for (pins.mux_sync) |p| p.set(); // released state
+    time.init_timer(.TIM2);
 
-    spi_dev = try hal.spi.SPI.init(.SPI1, .{
-        .mode = .master,
-        .direction = .one_line,
-        .data_size = .bits_8,
-        .cpol = .low,
-        .cpha = .first_edge,
-        .baud_div = 4,
-        .first_bit = .msb,
+    for (pins.mux_sync) |p| p.set_output_mode(.general_purpose_open_drain, .max_2MHz);
+    pins.spi_sck.set_output_mode(.alternate_function_push_pull, .max_50MHz);
+    pins.spi_mosi.set_output_mode(.alternate_function_push_pull, .max_50MHz);
+    pins.adc_in.set_input_mode(.analog);
+    pins.uart_tx.set_output_mode(.alternate_function_push_pull, .max_50MHz);
+    pins.uart_rx.set_input_mode(.floating);
+    pins.can_rx.set_input_mode(.floating);
+    pins.can_tx.set_output_mode(.alternate_function_push_pull, .max_50MHz);
+
+    for (pins.mux_sync) |p| p.put(1); // released state
+
+    spi.apply(.{
+        .chip_select = .GPIO,
+        .prescaler = .Div4,
     });
 
-    adc_dev = try hal.adc.ADC.init(.ADC1, .{
-        .channel = 2,
-        .sample_time = .cycles_239_5,
+    try uart.apply_runtime(.{
+        .clock_speed = rcc.get_clock(.USART1),
     });
 
-    uart_dev = try hal.uart.UART.init(.USART1, .{ .baud_rate = 115_200 });
-
-    enableDwtCycleCounter();
+    adc.enable();
+    adc.set_channel_sample_rate(2, .@"239.5");
 
     canInitFilter();
     canStart();
-
-    adc_dev.calibrate();
 
     var stats = TempStatistics{};
     const initial = TempStatistics{ .min_temp = 20, .max_temp = 20 };
 
     muxDisableAll();
-    hal.time.sleep_ms(10);
+    time.sleep_ms(10);
 
     canSendTemperatureStatistics(&initial) catch {};
 
