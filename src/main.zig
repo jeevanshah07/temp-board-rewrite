@@ -49,7 +49,6 @@ fn voltage_to_temp(voltage: f16) f16 {
 
 fn scan_all_channels(stats: *TempStats, report: bool) void {
     var highTemps: i8 = 0;
-    var temps = [_]i8{0} ** 90;
     var mux: usize = 0;
     var ch: usize = 0;
 
