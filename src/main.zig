@@ -26,9 +26,6 @@ comptime {
     _ = microzig.export_startup();
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 const NUM_MUXES: u8 = 3;
 const MUX_CHANNELS_PER_CHIP: u8 = 32;
 const MUX_DISABLE_CMD: u8 = 0x80;
@@ -46,10 +43,6 @@ const TempStatistics = struct {
     num_enabled: u8 = 0,
 };
 
-// ---------------------------------------------------------------------------
-// Biquad IIR filter — 2nd-order Butterworth lowpass @ 5kHz, fs = 250kHz
-// scipy.signal.butter(2, 5000, fs=250000, output='sos')
-// ---------------------------------------------------------------------------
 const BIQUAD_B0: f64 = 0.0036216815;
 const BIQUAD_B1: f64 = 0.0072433630;
 const BIQUAD_B2: f64 = 0.0036216815;
@@ -80,10 +73,8 @@ fn biquadProcess(mux: u8, ch: u8, x: f64) f64 {
     return y;
 }
 
-// ---------------------------------------------------------------------------
-// Pins
-// ---------------------------------------------------------------------------
 const pins = struct {
+    // PB0, PB1, PB2
     const mux_sync = [NUM_MUXES]gpio.Pin{
         gpio.Pin.from_port(.B, 0),
         gpio.Pin.from_port(.B, 1),
@@ -98,9 +89,6 @@ const pins = struct {
     const can_tx = gpio.Pin.from_port(.A, 12);
 };
 
-// ---------------------------------------------------------------------------
-// Mux control (bit-banged SYNC + SPI 1-line write, same as original)
-// ---------------------------------------------------------------------------
 fn muxWriteRaw(mux: MuxId, cmd: u8) !void {
     for (pins.mux_sync) |p| p.put(1); // deassert all (open-drain, high = released)
     const idx = @intFromEnum(mux);
@@ -130,9 +118,6 @@ fn muxSelectChannel(mux: MuxId, channel: u8) !void {
     try muxWriteRaw(mux, channel & 0x1F);
 }
 
-// ---------------------------------------------------------------------------
-// ADC — single conversion, blocking poll
-// ---------------------------------------------------------------------------
 fn adcReadRaw() u16 {
     return adc.read_single_channel(2) catch 0;
 }
@@ -141,9 +126,6 @@ fn adcReadRawSettled() u16 {
     return adcReadRaw();
 }
 
-// ---------------------------------------------------------------------------
-// Voltage -> temp, linear interpolation over datasheet table
-// ---------------------------------------------------------------------------
 const temp_table = [_]f32{ -40, -35, -30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120 };
 const volt_table = [_]f32{ 2.44, 2.42, 2.40, 2.38, 2.35, 2.32, 2.27, 2.23, 2.17, 2.11, 2.05, 1.99, 1.92, 1.86, 1.80, 1.74, 1.68, 1.63, 1.59, 1.55, 1.51, 1.48, 1.45, 1.43, 1.40, 1.38, 1.37, 1.35, 1.34, 1.33, 1.32, 1.31, 1.30 };
 
@@ -165,11 +147,6 @@ fn sensorVoltageToTempC(voltage: f32) f32 {
     return -999.0;
 }
 
-// ---------------------------------------------------------------------------
-// CAN — raw bxCAN register access (RM0008 ch. 24). Field names below assume
-// regz produced CMSIS-matching names; adjust casing if your generated SVD
-// module differs.
-// ---------------------------------------------------------------------------
 var can_tx_data: [8]u8 = undefined;
 
 fn canInitFilter() void {
@@ -191,8 +168,6 @@ fn canStart() void {
     while (can.MSR.read().INAK == 1) {}
 }
 
-/// checksum + no-ACK/mailbox-full visibility (fixes the silent-drop bug from
-/// the C version — returns error instead of swallowing HAL_BUSY)
 fn canFindFreeMailbox() !u2 {
     const tsr = peripherals.CAN.TSR.read();
     if (tsr.@"TME[0]" == 1) return 0;
@@ -240,9 +215,6 @@ fn canTransmit(ext_id: u32, data: []const u8) !void {
     mailbox.TIR.modify(.{ .TXRQ = 1 }); // request transmission
 }
 
-// ---------------------------------------------------------------------------
-// Main scan loop
-// ---------------------------------------------------------------------------
 fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
     // var temps: [90]u8 = [_]u8{0} ** 90;
     var high_temps: i8 = 0;
@@ -320,9 +292,6 @@ fn scanAllMuxChannels(stats: *TempStatistics, report: bool) void {
     muxDisableAll();
 }
 
-// ---------------------------------------------------------------------------
-// Clock config — HSE 8MHz -> PLLx9 = 72MHz, AHB /1, APB1 /2, ADC /6.
-// ---------------------------------------------------------------------------
 fn systemClockConfig() !void {
     _ = try rcc.apply(.{
         .SYSCLKSource = .PLL1_P,
@@ -338,9 +307,6 @@ fn systemClockConfig() !void {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 pub fn main() !void {
     try systemClockConfig();
 
